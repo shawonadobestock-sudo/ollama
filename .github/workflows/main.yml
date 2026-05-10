@@ -1,9 +1,9 @@
-name: Gemma 4 API via ngrok
+name: Gemma 4 API Fix (ngrok)
 on:
-  workflow_dispatch: # Allows you to start it manually
+  workflow_dispatch:
 
 jobs:
-  run-ai-server:
+  run-ai:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -13,42 +13,48 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama Server
+      - name: Configure and Start Ollama
         run: |
-          # Allow the chatbot site to connect (CORS Fix)
-          export OLLAMA_ORIGINS="*" 
+          # OLLAMA_HOST="0.0.0.0" makes the server listen to external traffic
+          # OLLAMA_ORIGINS="*" allows the web chatbot to bypass CORS security
+          export OLLAMA_HOST="0.0.0.0:11434"
+          export OLLAMA_ORIGINS="*"
+          
+          echo "Starting Ollama server..."
           ollama serve & 
-          sleep 10
+          
+          # Wait for server to wake up
+          sleep 15
 
-      - name: Pull Gemma 4
+      - name: Download Model
         run: |
-          # Using gemma:2b is recommended for faster testing on GitHub Runners
-          # Change to 'gemma4' if you have confirmed the runner can handle the size
+          # Pulling gemma:2b is recommended for stable performance on GitHub runners
+          echo "Downloading model..."
           ollama pull gemma:2b
 
-      - name: Setup ngrok
+      - name: Setup ngrok Tunnel
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          # Install ngrok
+          # Install ngrok via official script
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
           
-          # Authenticate
+          # Auth and Start Tunnel
           ngrok config add-authtoken $NGROK_AUTH_TOKEN
           
-          # Start Tunnel
-          ngrok http 11434 --log=stdout &
-          sleep 5
-
-      - name: Output Public URL
-        run: |
           echo "------------------------------------------------"
-          echo "COPY THIS URL TO YOUR CHATBOT SITE:"
-          curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+          echo "GETTING PUBLIC URL..."
+          # Start ngrok in background
+          ngrok http 11434 --log=stdout &
+          sleep 10
+          
+          # Extract and Print URL clearly
+          export PUBLIC_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+          echo "------------------------------------------------"
+          echo "COPY THIS URL: $PUBLIC_URL"
           echo "------------------------------------------------"
           
-          # Keep the action running for 6 hours (standard limit)
-          # This prevents the tunnel from closing immediately
+          # Keep runner alive for 6 hours
           sleep 21600
