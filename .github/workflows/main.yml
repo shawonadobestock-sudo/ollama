@@ -1,13 +1,10 @@
-name: Gemma 4 API Tunnel
+name: Gemma 4 API via ngrok
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to start it manually
 
 jobs:
-  run-gemma-api:
+  run-ai-server:
     runs-on: ubuntu-latest
-    # Setting a high timeout to keep the API alive as long as possible
-    timeout-minutes: 360 
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -18,37 +15,40 @@ jobs:
 
       - name: Start Ollama Server
         run: |
-          ollama serve > ollama.log 2>&1 &
-          sleep 10 # Wait for initialization
+          # Allow the chatbot site to connect (CORS Fix)
+          export OLLAMA_ORIGINS="*" 
+          ollama serve & 
+          sleep 10
 
-      - name: Download Gemma 4
+      - name: Pull Gemma 4
         run: |
-          # Note: Using gemma:2b/7b syntax as Gemma 4 identifies internally
-          # Adjust the tag based on the specific quantized version you need
-          ollama pull gemma4
+          # Using gemma:2b is recommended for faster testing on GitHub Runners
+          # Change to 'gemma4' if you have confirmed the runner can handle the size
+          ollama pull gemma:2b
 
-      - name: Install Cloudflared for Tunneling
+      - name: Setup ngrok
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
-
-      - name: Start Public API Tunnel
-        run: |
-          # Start the tunnel and extract the public URL to the logs
-          cloudflared tunnel --url http://localhost:11434 > tunnel.log 2>&1 &
-          sleep 5
-          echo "------------------------------------------------"
-          echo "YOUR PUBLIC API ENDPOINT URL:"
-          grep -o 'https://[-0-9a-z]*\.trycloudflare.com' tunnel.log
-          echo "------------------------------------------------"
-
-      - name: Keep Runner Alive
-        run: |
-          echo "API is live. You can now send requests to the URL above."
-          echo "Example: curl [YOUR_URL]/api/generate -d '{\"model\": \"gemma4\", \"prompt\": \"hi\"}'"
+          # Install ngrok
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install ngrok
           
-          # This loop keeps the action running so the API stays active
-          # It will stop automatically after 6 hours (GitHub limit)
-          for i in {1..21600}; do
-            sleep 1
-          done
+          # Authenticate
+          ngrok config add-authtoken $NGROK_AUTH_TOKEN
+          
+          # Start Tunnel
+          ngrok http 11434 --log=stdout &
+          sleep 5
+
+      - name: Output Public URL
+        run: |
+          echo "------------------------------------------------"
+          echo "COPY THIS URL TO YOUR CHATBOT SITE:"
+          curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+          echo "------------------------------------------------"
+          
+          # Keep the action running for 6 hours (standard limit)
+          # This prevents the tunnel from closing immediately
+          sleep 21600
