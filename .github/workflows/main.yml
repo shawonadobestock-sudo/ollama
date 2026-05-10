@@ -1,12 +1,12 @@
-name: Gemma 4 API Fix (ngrok)
+name: Gemma 4 API (Production Fix)
 on:
   workflow_dispatch:
 
 jobs:
-  run-ai:
+  serve:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Ollama
@@ -15,46 +15,41 @@ jobs:
 
       - name: Configure and Start Ollama
         run: |
-          # OLLAMA_HOST="0.0.0.0" makes the server listen to external traffic
-          # OLLAMA_ORIGINS="*" allows the web chatbot to bypass CORS security
+          # 0.0.0.0:11434 = Listen on all network interfaces
+          # OLLAMA_ORIGINS="*" = Allow the chatbot website to connect
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_ORIGINS="*"
           
-          echo "Starting Ollama server..."
+          echo "Starting Ollama Server..."
           ollama serve & 
-          
-          # Wait for server to wake up
-          sleep 15
+          sleep 15 # Wait for initialization
 
-      - name: Download Model
+      - name: Pull Model
         run: |
-          # Pulling gemma:2b is recommended for stable performance on GitHub runners
-          echo "Downloading model..."
+          # Pulling gemma:2b for stability on 7GB RAM runners
           ollama pull gemma:2b
 
       - name: Setup ngrok Tunnel
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          # Install ngrok via official script
+          # Install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
           
-          # Auth and Start Tunnel
+          # Authenticate
           ngrok config add-authtoken $NGROK_AUTH_TOKEN
           
-          echo "------------------------------------------------"
-          echo "GETTING PUBLIC URL..."
-          # Start ngrok in background
-          ngrok http 11434 --log=stdout &
+          # CRITICAL: --host-header fix for Ollama API
+          echo "Starting Tunnel..."
+          ngrok http 11434 --host-header="localhost:11434" --log=stdout &
           sleep 10
           
-          # Extract and Print URL clearly
-          export PUBLIC_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
           echo "------------------------------------------------"
-          echo "COPY THIS URL: $PUBLIC_URL"
+          echo "PUBLIC ENDPOINT FOR CHATBOT:"
+          curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
           echo "------------------------------------------------"
           
-          # Keep runner alive for 6 hours
+          # Keep Action alive for 6 hours
           sleep 21600
