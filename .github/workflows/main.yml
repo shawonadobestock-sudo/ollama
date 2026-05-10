@@ -1,49 +1,926 @@
-name: Gemma 4 API (E2B Version)
+name: ☁️ Bulk Ringtone Generator → Firebase
+
 on:
   workflow_dispatch:
+    inputs:
+      prompts:
+        description: |
+          🎵 Music Prompts (one per line) — leave blank to use PROMPTS secret
+          Example:
+            Piano sad emotional melody ambient pad 80 bpm
+            Energetic upbeat dance electronic 128 bpm
+        required: false
+        default: ""
+        type: string
+
+      length_seconds:
+        description: "⏱️ Duration per ringtone (seconds, e.g. 5)"
+        required: true
+        default: "5"
+
+      auto_process:
+        description: "🎛️ Auto-process audio (trim silence + volume boost)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      volume_boost_pct:
+        description: "🔊 Volume boost % (100–400)"
+        required: false
+        default: "200"
+
+      silence_threshold:
+        description: "🔇 Silence trim threshold (0.005–0.1)"
+        required: false
+        default: "0.02"
+
+      pad_ms:
+        description: "⏩ Edge padding ms (0–500)"
+        required: false
+        default: "100"
+
+      target_account:
+        description: "🔥 Target Firebase DB (Zedge account)"
+        required: true
+        default: "zedge_2"
+        type: choice
+        options:
+          - zedge_1
+          - zedge_2
+          - zedge_3
+          - all_three
+
+      gemini_api_keys:
+        description: "🤖 Gemini API Keys (one per line — overrides secret if filled)"
+        required: false
+        default: ""
+
+      use_local_gemma:
+        description: "🦙 Use Local Gemma 4 via Ollama (No API limits, runs natively on runner!)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
-  serve-ai:
+  generate-ringtones:
+    name: 🎵 Generate & Push Ringtones to Firebase
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Install Ollama
+    steps:
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 🦙 Install & Start Local Ollama (Gemma 4)
+        if: ${{ github.event.inputs.use_local_gemma == 'true' }}
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-
-      - name: Start Ollama (Remote Config)
-        run: |
-          # 0.0.0.0 allows ngrok to connect to the internal port
-          export OLLAMA_HOST="0.0.0.0:11434"
-          export OLLAMA_ORIGINS="*"
-          ollama serve & 
-          sleep 15
-
-      - name: Pull Effective Gemma 4
-        run: |
-          # 'e2b' is the correct tag for the 2026 small Gemma 4 model
+          ollama serve &
+          sleep 10
           echo "Pulling gemma4:e2b..."
           ollama pull gemma4:e2b
 
-      - name: Setup ngrok Tunnel
-        env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      - name: 📥 Install Dependencies
         run: |
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install ngrok
-          ngrok config add-authtoken $NGROK_AUTH_TOKEN
-          
-          # Fix the Host Header for external API access
-          ngrok http 11434 --host-header="localhost:11434" --log=stdout &
-          sleep 10
-          
-          echo "------------------------------------------------"
-          echo "PUBLIC URL: $(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
-          echo "MODEL TAG TO USE: gemma4:e2b"
-          echo "------------------------------------------------"
-          
-          # 6-hour runtime
-          sleep 21600
+          npm init -y
+          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth
+          npx playwright install chromium --with-deps
+
+      - name: 🖥️ Start Virtual Display (Xvfb)
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "✅ Xvfb virtual display started on :99"
+
+      - name: 🎵 Generate Ringtones & Push to Firebase
+        env:
+          STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
+          USE_LOCAL_GEMMA: ${{ github.event.inputs.use_local_gemma }}
+          PROMPTS_SECRET: ${{ secrets.PROMPTS }}
+          PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
+          TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
+          LENGTH_SECONDS: ${{ github.event.inputs.length_seconds }}
+          AUTO_PROCESS: ${{ github.event.inputs.auto_process }}
+          VOLUME_BOOST_PCT: ${{ github.event.inputs.volume_boost_pct }}
+          SILENCE_THRESHOLD: ${{ github.event.inputs.silence_threshold }}
+          PAD_MS: ${{ github.event.inputs.pad_ms }}
+        run: |
+          cat > generator.mjs << 'SCRIPT_EOF'
+          import fetch from 'node-fetch';
+          import fs from 'fs';
+          import path from 'path';
+          import { execSync } from 'child_process';
+          import { createRequire } from 'module';
+
+          // ─── CONFIG ────────────────────────────────────────────────────────────────
+          const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
+          const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
+          const USE_LOCAL_GEMMA      = process.env.USE_LOCAL_GEMMA === 'true';
+          const OLLAMA_URL           = USE_LOCAL_GEMMA ? 'http://localhost:11434' : '';
+          const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
+          const QUEUE_PATH           = 'wallpaperQueue';
+          const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
+          const LENGTH_SECONDS       = parseInt(process.env.LENGTH_SECONDS || '30', 10);
+          const AUTO_PROCESS         = process.env.AUTO_PROCESS !== 'false';
+          const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
+          const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
+          const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
+
+          // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
+          const FIREBASE_DB_MAP = {
+            zedge_1: 'https://zedgeautomation-default-rtdb.firebaseio.com',
+            zedge_2: 'https://zedge-automation-2-default-rtdb.asia-southeast1.firebasedatabase.app',
+            zedge_3: 'https://zedge-automation-3-default-rtdb.asia-southeast1.firebasedatabase.app'
+          };
+
+          // Resolve which DB URLs to target
+          let TARGET_DB_URLS;
+          if (TARGET_ACCOUNT === 'all_three') {
+            TARGET_DB_URLS = Object.entries(FIREBASE_DB_MAP).map(([name, url]) => ({ name, url }));
+          } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
+            TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
+          } else {
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_three`);
+            process.exit(1);
+          }
+
+          // ─── VALIDATION ────────────────────────────────────────────────────────────
+          // Note: STABLE_AUDIO_TOKEN is OPTIONAL — if empty, account is auto-created at startup
+
+          const GEMINI_KEYS = GEMINI_KEYS_RAW
+            .split(/[\n,]+/)
+            .map(k => k.trim())
+            .filter(k => k.length > 10);
+
+          if (!GEMINI_KEYS.length && !OLLAMA_URL) {
+            console.error('❌ Neither GEMINI_API_KEYS nor OLLAMA_URL is set. Please provide at least one.');
+            process.exit(1);
+          }
+
+          const PROMPTS = PROMPTS_RAW
+            .split('\n')
+            .map(p => p.trim())
+            .filter(Boolean);
+
+          if (!PROMPTS.length) {
+            console.error('❌ No prompts found. Enter at least one prompt in the workflow input.');
+            process.exit(1);
+          }
+
+          console.log('============================================================');
+          console.log('  ☁️  BULK RINGTONE GENERATOR → FIREBASE');
+          console.log('============================================================');
+          console.log(`📋 Prompts: ${PROMPTS.length}`);
+          console.log(`⏱️  Duration: ${LENGTH_SECONDS}s per ringtone`);
+          console.log(`🎛️  Auto-process: ${AUTO_PROCESS ? 'Yes' : 'No'}`);
+          if (AUTO_PROCESS) {
+            console.log(`🔊 Volume Boost: ${Math.round(VOLUME_BOOST * 100)}%`);
+            console.log(`🔇 Silence Threshold: ${SILENCE_THRESHOLD}`);
+            console.log(`⏩ Pad: ${Math.round(PAD_SEC * 1000)}ms`);
+          }
+          console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
+          TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
+          console.log(`📂 Queue Path: ${QUEUE_PATH}`);
+          console.log(`🤖 Gemini Keys: ${GEMINI_KEYS.length}`);
+          console.log('============================================================\n');
+
+          // ─── GEMINI KEY ROTATION ───────────────────────────────────────────────────
+          let _geminiKeyIdx = 0;
+          function getNextGeminiKey() {
+            const key = GEMINI_KEYS[_geminiKeyIdx % GEMINI_KEYS.length];
+            _geminiKeyIdx = (_geminiKeyIdx + 1) % GEMINI_KEYS.length;
+            return key;
+          }
+
+          const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
+          async function callGemini(promptText, retries = 3) {
+            // Route to Ollama if URL is provided
+            if (OLLAMA_URL) {
+              for (let attempt = 1; attempt <= retries; attempt++) {
+                try {
+                  const res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      model: 'gemma4:e2b',
+                      messages: [{ role: 'user', content: promptText }],
+                      temperature: 1,
+                      top_p: 0.95,
+                      max_tokens: 1024
+                    })
+                  });
+                  if (!res.ok) throw new Error(`Ollama error (${res.status}): ${await res.text()}`);
+                  const data = await res.json();
+                  return data.choices[0].message.content.trim();
+                } catch (e) {
+                  if (attempt >= retries) throw e;
+                  console.warn(`  ⚠️ Ollama attempt ${attempt} failed: ${e.message}. Retrying...`);
+                  await sleep(2000);
+                }
+              }
+            }
+
+            // Fallback to Gemini if no Ollama URL
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              const apiKey = getNextGeminiKey();
+              try {
+                const res = await fetch(
+                  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+                    body: JSON.stringify({
+                      contents: [{ parts: [{ text: promptText }] }],
+                      generationConfig: { temperature: 1, topP: 0.95, topK: 40, maxOutputTokens: 1024 }
+                    })
+                  }
+                );
+                if (!res.ok) {
+                  const err = await res.text();
+                  if (res.status === 429) {
+                    console.warn(`  ⚠️ Gemini rate limit (429) hit. Waiting 1 minute before retrying...`);
+                    await sleep(60000);
+                    attempt--; // Do not count rate limits against max retries
+                    continue;
+                  }
+                  if (attempt < retries) {
+                    console.warn(`  ⚠️ Gemini attempt ${attempt} failed (${res.status}). Retrying with next key...`);
+                    await sleep(2000);
+                    continue;
+                  }
+                  throw new Error(`Gemini error (${res.status}): ${err.slice(0, 200)}`);
+                }
+                const data = await res.json();
+                return data.candidates[0].content.parts.map(p => p.text).join('').trim();
+              } catch (e) {
+                if (attempt >= retries) throw e;
+                await sleep(2000);
+              }
+            }
+          }
+
+          // ─── VALID RINGTONE CATEGORIES ─────────────────────────────────────────────
+          const VALID_RT_CATS = [
+            'LATIN', 'MESSAGE_TONES', 'OTHER', 'POP', 'RNB_SOUL', 'REGGAE', 'RELIGIOUS', 'ROCK',
+            'SAYINGS', 'ALTERNATIVE', 'ANIMALS', 'BLUES', 'BOLLYWOOD', 'CHILDREN', 'CLASSICAL',
+            'SOUND_EFFECTS', 'WORLD', 'COMEDY', 'CONTACT_RINGTONES', 'COUNTRY', 'DANCE',
+            'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
+          ];
+
+          // ─── METADATA GENERATION (4 parallel Gemini calls) ────────────────────────
+          async function generateMetadataFromPrompt(prompt) {
+            console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
+
+            const [title, keywords, category, description] = await Promise.all([
+              callGemini(
+                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+                `Generate a creative, catchy title that is naturally around 30 characters long. ` +
+                `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
+                `Only provide the title itself, no extra text or instructions.`
+              ),
+              callGemini(
+                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+                `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
+                `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
+                `Present keywords in a single comma-separated line without punctuation or full stops.`
+              ),
+              callGemini(
+                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+                `Analyze and select the most appropriate category from this exact list. ` +
+                `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`
+              ),
+              callGemini(
+                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+                `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
+                `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
+                `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
+                `Return ONLY the short description, nothing else.`
+              )
+            ]);
+
+            const cleanedTags = keywords
+              .split(',')
+              .map(k => k.replace(/[^a-zA-Z0-9]/g, ''))
+              .filter(k => k && k.length > 0 && k.length <= 24)
+              .slice(0, 10)
+              .join(', ');
+
+            const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
+            return {
+              title: title.replace(/^["']|["']$/g, '').slice(0, 30),
+              tags: cleanedTags,
+              category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
+              description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
+            };
+          }
+
+          // ─── CREDENTIAL HELPERS ────────────────────────────────────────────────────
+          function generateRandomEmail() {
+            const ts  = Date.now();
+            const rnd = Math.random().toString(36).substring(2, 10);
+            const domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+            const domain  = domains[Math.floor(Math.random() * domains.length)];
+            return `stableaudio_${rnd}_${ts}@${domain}`;
+          }
+
+          function generateStrongPassword() {
+            const lc  = 'abcdefghijklmnopqrstuvwxyz';
+            const uc  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+            const num = '0123456789';
+            const sp  = '!@#$%^&*';
+            let pw = '';
+            pw += lc[Math.floor(Math.random() * lc.length)];
+            pw += lc[Math.floor(Math.random() * lc.length)];
+            pw += uc[Math.floor(Math.random() * uc.length)];
+            pw += uc[Math.floor(Math.random() * uc.length)];
+            pw += num[Math.floor(Math.random() * num.length)];
+            pw += num[Math.floor(Math.random() * num.length)];
+            pw += sp[Math.floor(Math.random() * sp.length)];
+            pw += sp[Math.floor(Math.random() * sp.length)];
+            const all = lc + uc + num + sp;
+            for (let i = 0; i < 4; i++) pw += all[Math.floor(Math.random() * all.length)];
+            return pw.split('').sort(() => Math.random() - 0.5).join('');
+          }
+
+          // ─── AUTO ACCOUNT CREATION (Playwright — mirrors background.js) ───────────
+          // Called automatically when Stable Audio API returns a rate-limit error.
+          // Returns the new Bearer token string, or throws on failure.
+          async function createStableAudioAccount() {
+            const email    = generateRandomEmail();
+            const password = generateStrongPassword();
+
+            console.log('\n  🤖 AUTO ACCOUNT CREATION STARTED');
+            console.log(`  📧 Email   : ${email}`);
+            console.log(`  🔑 Password: ${password}`);
+
+            // Use playwright-extra + stealth plugin → bypasses Auth0 bot detection
+            // Xvfb virtual display is already running (started by the workflow step above)
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
+
+            const browser = await chromium.launch({
+              headless: false,  // Real browser on Xvfb — undetectable by Auth0
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+              ]
+            });
+
+            let capturedToken = null;
+
+            try {
+              const context = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+              });
+              const page = await context.newPage();
+
+              // ── Intercept network to capture Bearer token ──────────────────────────
+              // Stable Audio's SPA sends the access token in Authorization headers.
+              // We sniff it from outgoing requests to their API.
+              page.on('request', req => {
+                const auth = req.headers()['authorization'];
+                if (auth && auth.startsWith('Bearer ') && req.url().includes('stableaudio.com')) {
+                  const tok = auth.replace('Bearer ', '').trim();
+                  if (tok.length > 50) {
+                    capturedToken = tok;
+                    console.log('  🔑 Token captured from network request!');
+                  }
+                }
+              });
+              // Also sniff /oauth/token response (PKCE code exchange) — this is the key one!
+              page.on('response', async resp => {
+                try {
+                  const url = resp.url();
+                  const isTokenEndpoint = url.includes('/oauth/token') || url.includes('/token') || url.includes('auth0') || url.includes('login.stableaudio');
+                  if (isTokenEndpoint && resp.status() === 200) {
+                    const json = await resp.json().catch(() => null);
+                    if (json && (json.access_token || json.id_token)) {
+                      capturedToken = json.access_token || json.id_token;
+                      console.log(`  🔑 Token captured from /oauth/token response!`);
+                    }
+                  }
+                } catch {}
+              });
+
+              // ── Step 1: Hit Auth0 logout to destroy SSO session server-side ──────
+              console.log('  🔓 Step 1: Destroying existing Auth0 SSO session...');
+              await page.goto('https://login.stableaudio.com/v2/logout', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+              await sleep(2000);
+
+              // ── Step 2: Clear all cookies + localStorage ──────────────────────────
+              console.log('  🧹 Step 2: Wiping all cookies and storage...');
+              await context.clearCookies();
+              await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
+
+              // ── Step 3: Load Stable Audio fresh ───────────────────────────────────
+              console.log('  🌐 Step 3: Loading fresh Stable Audio page...');
+              await page.goto('https://stableaudio.com', { waitUntil: 'networkidle', timeout: 30000 });
+              await sleep(2000);
+
+              // ── Step 4: Click Sign Up button ─────────────────────────────────────
+              console.log('  🖱️  Step 4: Looking for Sign Up button...');
+              const signupSelectors = [
+                'button:has-text("Sign up")',
+                'button:has-text("Sign Up")',
+                'a:has-text("Sign up")',
+                '[data-testid="signup"]'
+              ];
+              let clicked = false;
+              for (const sel of signupSelectors) {
+                try {
+                  await page.waitForSelector(sel, { timeout: 5000 });
+                  await page.click(sel);
+                  clicked = true;
+                  console.log(`  ✅ Sign Up clicked (${sel})`);
+                  break;
+                } catch {}
+              }
+              if (!clicked) {
+                // Try evaluating in-page
+                clicked = await page.evaluate(() => {
+                  const btn = Array.from(document.querySelectorAll('button')).find(b =>
+                    ['sign up', 'sign-up'].includes(b.textContent.trim().toLowerCase())
+                  );
+                  if (btn) { btn.click(); return true; }
+                  return false;
+                });
+                if (!clicked) throw new Error('Could not find Sign Up button on Stable Audio page.');
+              }
+              await sleep(3000);
+
+              // ── Step 5: Wait for Auth0 email input ───────────────────────────────
+              console.log('  📝 Step 5: Waiting for Auth0 registration form...');
+              await page.waitForSelector('input[name="email"]', { timeout: 20000 });
+
+              // ── Step 6: Fill email + password using React-compatible dispatch ────
+              console.log('  ✍️  Step 6: Filling credentials...');
+              await page.evaluate(({ em, pw }) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                const emailEl = document.querySelector('input[name="email"]');
+                const passEl  = document.querySelector('input[name="password"]');
+                if (emailEl) {
+                  setter.call(emailEl, em);
+                  emailEl.dispatchEvent(new Event('input',  { bubbles: true }));
+                  emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                if (passEl) {
+                  setter.call(passEl, pw);
+                  passEl.dispatchEvent(new Event('input',  { bubbles: true }));
+                  passEl.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              }, { em: email, pw: password });
+              await sleep(800);
+
+              // ── Step 7: Submit the form ───────────────────────────────────────────
+              console.log('  🚀 Step 7: Submitting registration form...');
+              await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
+              await page.click('button[type="submit"]');
+
+              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
+              // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
+              // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
+              // We MUST NOT navigate away during this exchange — stay on callback URL!
+              console.log('  ⏳ Step 8: Waiting for OAuth code exchange + token...');
+
+              // 8a: Wait until we land on stableaudio.com
+              if (!page.url().includes('stableaudio.com')) {
+                try {
+                  await page.waitForURL(url => url.includes('stableaudio.com'), { timeout: 60000 });
+                  console.log(`  ✅ OAuth callback arrived: ${page.url()}`);
+                } catch {
+                  console.warn(`  ⚠️ Timeout waiting for redirect — on: ${page.url()}`);
+                }
+              } else {
+                console.log(`  ✅ Already on stableaudio.com: ${page.url()}`);
+              }
+
+              // 8b: If URL has ?code= the SPA is exchanging it — wait for clean URL
+              if (page.url().includes('code=')) {
+                console.log('  🔄 OAuth code exchange in progress — waiting (do NOT navigate)...');
+                try {
+                  await page.waitForURL(
+                    url => url.includes('stableaudio.com') && !url.includes('code='),
+                    { timeout: 30000 }
+                  );
+                  console.log(`  ✅ Code exchanged! URL: ${page.url()}`);
+                } catch {
+                  console.warn('  ⚠️ Code cleanup timeout — token may already be in localStorage');
+                }
+              }
+              await sleep(3000);
+
+              // 8c: Poll for token (90s window, 3 strategies)
+              console.log('  🔍 Step 8c: Polling for token...');
+              const tokenDeadline = Date.now() + 90000;
+              while (!capturedToken && Date.now() < tokenDeadline) {
+                // Strategy 1: Deep localStorage scan
+                const lsToken = await page.evaluate(() => {
+                  for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (!key) continue;
+                    try {
+                      const parsed = JSON.parse(localStorage.getItem(key));
+                      if (parsed?.body?.access_token) return parsed.body.access_token;
+                      if (parsed?.access_token)       return parsed.access_token;
+                      if (parsed?.idToken)             return parsed.idToken;
+                    } catch {}
+                  }
+                  return null;
+                }).catch(() => null);
+                if (lsToken) { capturedToken = lsToken; break; }
+
+                // Strategy 2: Fetch interceptor (sniff outgoing Authorization headers)
+                const intercepted = await page.evaluate(() => {
+                  if (window.__sniffedToken) return window.__sniffedToken;
+                  if (!window.__fetchPatched) {
+                    window.__fetchPatched = true;
+                    const origFetch = window.fetch;
+                    window.fetch = function(...args) {
+                      const [, opts] = args;
+                      const auth = opts?.headers?.Authorization || opts?.headers?.authorization || '';
+                      if (auth.startsWith('Bearer ') && auth.length > 60)
+                        window.__sniffedToken = auth.replace('Bearer ', '');
+                      return origFetch.apply(this, args);
+                    };
+                  }
+                  return null;
+                }).catch(() => null);
+                if (intercepted) { capturedToken = intercepted; break; }
+
+                await sleep(1500);
+              }
+
+              if (!capturedToken) throw new Error('Token not captured within 90s after OAuth code exchange.');
+
+              console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
+              console.log(`  📧 ${email}`);
+              console.log(`  🔑 Token: ${capturedToken.slice(0, 30)}...`);
+              return capturedToken;
+
+            } finally {
+              await browser.close().catch(() => {});
+            }
+          }
+
+          // ─── STABLE AUDIO API ──────────────────────────────────────────────────────
+          // Live token — starts empty, set by auto-account-creation or from secret
+          let currentToken = STABLE_AUDIO_TOKEN || null;
+
+          async function generateStableAudio(prompt, lengthSeconds, isRetry = false) {
+            const seed = Math.floor(Math.random() * 65536) - 32768;
+            console.log(`  🎵 Calling Stable Audio API... (seed: ${seed})`);
+
+            const res = await fetch(
+              'https://api.stableaudio.com/v1alpha/generations/stable-audio-v2-5/text-to-music',
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${currentToken}`
+                },
+                body: JSON.stringify({
+                  data: {
+                    type: 'generations',
+                    attributes: {
+                      prompts: [{ text: prompt, weight: 1 }],
+                      length_seconds: lengthSeconds,
+                      seed
+                    }
+                  }
+                })
+              }
+            );
+
+            if (!res.ok) {
+              const errText = await res.text();
+              const errLower = errText.toLowerCase();
+              const isLimitError = (
+                res.status === 429 ||
+                (res.status === 400 && (
+                  errLower.includes('limit') || errLower.includes('quota') ||
+                  errLower.includes('credit') || errLower.includes('rate') ||
+                  errLower.includes('exceeded') || errLower.includes('insufficient')
+                ))
+              );
+
+              if (isLimitError && !isRetry) {
+                console.warn('\n  ⚠️ API limit hit! Auto-creating new Stable Audio account...');
+                currentToken = await createStableAudioAccount();
+                console.log('  🔄 Retrying prompt with new token...');
+                return generateStableAudio(prompt, lengthSeconds, true); // retry once
+              }
+              if (isLimitError) throw new Error(`API_LIMIT_REACHED (auto-recovery also failed): ${errText.slice(0, 200)}`);
+              throw new Error(`Stable Audio API error (${res.status}): ${errText.slice(0, 300)}`);
+            }
+
+            const data = await res.json();
+            return { resultUrl: data.data[0].links.result, seed };
+          }
+
+          async function pollStableAudioResult(resultUrl) {
+            const maxRetries = 60;
+            for (let i = 0; i < maxRetries; i++) {
+              process.stdout.write(`  ⏳ Polling result... attempt ${i + 1}/${maxRetries}\r`);
+              const res = await fetch(resultUrl, {
+                headers: { 'Authorization': `Bearer ${currentToken}`, 'Accept': '*/*' }
+              });
+              if (res.status === 200) {
+                process.stdout.write('\n');
+                console.log(`  ✅ Audio generation complete!`);
+                return Buffer.from(await res.arrayBuffer());
+              }
+              if (res.status === 202) {
+                await sleep(3000);
+              } else {
+                throw new Error(`Poll failed: HTTP ${res.status}`);
+              }
+            }
+            throw new Error('Timed out waiting for audio generation (3 minutes).');
+          }
+
+          // ─── AUDIO AUTO-PROCESSING (via ffmpeg) ────────────────────────────────────
+          // Trim silence + apply volume boost using ffmpeg (server-side equivalent of browser AudioContext)
+          async function autoProcessAudio(inputBuffer, gainFactor, silenceThreshold, padSec) {
+            const tmpDir    = '/tmp/ringtone_proc';
+            fs.mkdirSync(tmpDir, { recursive: true });
+            const tmpIn     = path.join(tmpDir, `in_${Date.now()}.mp3`);
+            const tmpOut    = path.join(tmpDir, `out_${Date.now()}.mp3`);
+
+            fs.writeFileSync(tmpIn, inputBuffer);
+
+            // ffmpeg command:
+            //   silenceremove: trim leading/trailing silence
+            //   volume: amplify by gainFactor
+            const dbThreshold = 20 * Math.log10(silenceThreshold); // convert linear to dB
+            const dbStr = `${dbThreshold.toFixed(1)}dB`;
+            const padMs = Math.round(padSec * 1000);
+
+            try {
+              // Step 1: Detect silence boundaries and trim
+              const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+              const filterComplex = [
+                // Trim silence from start (stop_periods=0 means only trim start)
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                // Trim silence from end (by reversing, trimming, reversing back)
+                `areverse`,
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                `areverse`,
+                // Apply volume boost
+                `volume=${gainFactor}`
+              ].join(',');
+
+              execSync(
+                `${ffmpegPath} -i "${tmpIn}" -af "${filterComplex}" -ar 44100 -ab 192k -y "${tmpOut}" 2>/dev/null`,
+                { timeout: 60000 }
+              );
+
+              if (!fs.existsSync(tmpOut) || fs.statSync(tmpOut).size < 1000) {
+                throw new Error('ffmpeg output empty or too small');
+              }
+
+              const outBuf = fs.readFileSync(tmpOut);
+              console.log(`  🎛️  Processed: ${(inputBuffer.length / 1024).toFixed(0)}KB → ${(outBuf.length / 1024).toFixed(0)}KB`);
+              return outBuf;
+            } finally {
+              try { fs.unlinkSync(tmpIn); } catch {}
+              try { fs.unlinkSync(tmpOut); } catch {}
+            }
+          }
+
+          // ─── FIREBASE HELPERS ──────────────────────────────────────────────────────
+          // Push to a single DB URL, returns the new Firebase key
+          async function firebasePushToUrl(dbUrl, queuePath, data) {
+            const res = await fetch(`${dbUrl}/${queuePath}.json`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(data)
+            });
+            if (!res.ok) {
+              const err = await res.text();
+              throw new Error(`Firebase push failed (${res.status}): ${err.slice(0, 200)}`);
+            }
+            const result = await res.json();
+            return result.name;
+          }
+
+          // Push to ALL target DBs in parallel, returns array of { name, key }
+          async function firebasePushAll(queuePath, data) {
+            const results = await Promise.allSettled(
+              TARGET_DB_URLS.map(async db => {
+                const key = await firebasePushToUrl(db.url, queuePath, data);
+                return { dbName: db.name, key };
+              })
+            );
+            const pushed = [];
+            for (const r of results) {
+              if (r.status === 'fulfilled') pushed.push(r.value);
+              else console.error(`  ⚠️ Push failed for one DB: ${r.reason?.message}`);
+            }
+            if (!pushed.length) throw new Error('All Firebase pushes failed!');
+            return pushed;
+          }
+
+          // ─── UTILITY ──────────────────────────────────────────────────────────────
+          function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+          function randomName(ext = '.mp3') {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + ext;
+          }
+
+          // ─── GENERATE ONE UNIQUE RINGTONE FOR A SINGLE DB ─────────────────────────
+          // Used by both single-account and all_three modes.
+          // Each call produces a fresh audio (new seed) + fresh metadata → unique upload.
+          async function generateAndPushOne(prompt, dbTarget) {
+            // Step A: Unique metadata per account (Gemini re-called each time)
+            let meta;
+            try {
+              meta = await generateMetadataFromPrompt(prompt);
+              console.log(`  📝 [${dbTarget.name}] Title: "${meta.title}"`);
+              console.log(`  🏷️  [${dbTarget.name}] Tags: ${meta.tags}`);
+            } catch (e) {
+              console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
+              meta = {
+                title: prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
+                tags: '',
+                category: 'OTHER',
+                description: ''
+              };
+            }
+
+            // Step B: Generate unique audio (each call gets a random seed → different sound)
+            const { resultUrl } = await generateStableAudio(prompt, LENGTH_SECONDS);
+            let audioBuffer = await pollStableAudioResult(resultUrl);
+
+            // Step C: Optional auto-processing
+            if (AUTO_PROCESS) {
+              try {
+                audioBuffer = await autoProcessAudio(audioBuffer, VOLUME_BOOST, SILENCE_THRESHOLD, PAD_SEC);
+              } catch (e) {
+                console.warn(`  ⚠️ [${dbTarget.name}] Auto-process failed: ${e.message}`);
+              }
+            }
+
+            // Step D: Push to this specific DB only
+            const fileBase64 = `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`;
+            const fileName = randomName('.mp3');
+            const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
+              name: fileName,
+              type: 'audio/mpeg',
+              size: audioBuffer.length,
+              width: null,
+              height: null,
+              isMp3: true,
+              fileBase64,
+              title: meta.title,
+              tags: meta.tags,
+              category: meta.category,
+              description: meta.description,
+              status: 'queued',
+              prompt,
+              createdAt: Date.now()
+            });
+            console.log(`  ✅ [${dbTarget.name}] key: ${key}  🎵 "${meta.title}" → ${(audioBuffer.length / 1024).toFixed(0)}KB`);
+            return { dbName: dbTarget.name, key, title: meta.title, category: meta.category };
+          }
+
+          // ─── PROCESS A SINGLE PROMPT ───────────────────────────────────────────────
+          async function processPrompt(idx, prompt) {
+            const num = `[${idx + 1}/${PROMPTS.length}]`;
+            console.log(`\n${num} ─────────────────────────────────────────────`);
+            console.log(`${num} Prompt: "${prompt}"`);
+            console.log(`${num} ─────────────────────────────────────────────`);
+
+            if (TARGET_DB_URLS.length === 1) {
+              // ── Single account: 1 audio → 1 DB ─────────────────────────────────────
+              const result = await generateAndPushOne(prompt, TARGET_DB_URLS[0]);
+              return { keys: [result], title: result.title, category: result.category };
+
+            } else {
+              // ── all_three: generate a UNIQUE audio per account (NOT the same file!) ──
+              // Each account gets a different seed → different sound → safe from duplicate detection
+              console.log(`  🔀 all_three mode: generating ${TARGET_DB_URLS.length} UNIQUE audios (one per account)...`);
+              const pushResults = [];
+              for (const dbTarget of TARGET_DB_URLS) {
+                console.log(`\n  ➡️  Generating unique ringtone for [${dbTarget.name}]...`);
+                try {
+                  const result = await generateAndPushOne(prompt, dbTarget);
+                  pushResults.push(result);
+                } catch (e) {
+                  console.error(`  ❌ [${dbTarget.name}] Failed: ${e.message}`);
+                }
+                // Small delay between accounts to avoid API burst
+                if (TARGET_DB_URLS.indexOf(dbTarget) < TARGET_DB_URLS.length - 1) {
+                  await sleep(3000);
+                }
+              }
+              if (!pushResults.length) throw new Error('All account pushes failed.');
+              return { keys: pushResults, title: pushResults[0].title, category: pushResults[0].category };
+            }
+          }
+
+
+          // ─── STARTUP: AUTO-CREATE ACCOUNT IF NO TOKEN PROVIDED ─────────────────────
+          if (!currentToken) {
+            console.log('\n⚠️  No STABLE_AUDIO_TOKEN provided — auto-creating Stable Audio account...');
+            try {
+              currentToken = await createStableAudioAccount();
+              console.log('✅ Startup account creation successful. Starting generation...');
+            } catch (startupErr) {
+              console.error(`❌ Startup account creation FAILED: ${startupErr.message}`);
+              console.error('   Cannot proceed without a valid token.');
+              process.exit(1);
+            }
+          } else {
+            console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
+          }
+
+          // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
+          let successCount = 0;
+          let failedCount = 0;
+          const results = [];
+
+          for (let i = 0; i < PROMPTS.length; i++) {
+            try {
+              const result = await processPrompt(i, PROMPTS[i]);
+              results.push({ status: 'success', ...result, prompt: PROMPTS[i] });
+              successCount++;
+            } catch (err) {
+              console.error(`\n❌ Prompt ${i + 1} FAILED: ${err.message}`);
+              results.push({ status: 'failed', prompt: PROMPTS[i], error: err.message });
+              failedCount++;
+
+              // If API limit is hit, abort remaining prompts
+              if (err.message.startsWith('API_LIMIT_REACHED')) {
+                console.error('\n🛑 Aborting: Stable Audio API credits exhausted.');
+                console.error('   Update STABLE_AUDIO_TOKEN secret with a fresh token and re-run.');
+                for (let j = i + 1; j < PROMPTS.length; j++) {
+                  results.push({ status: 'skipped', prompt: PROMPTS[j] });
+                }
+                break;
+              }
+
+              // Small delay before retrying next prompt
+              if (i < PROMPTS.length - 1) {
+                console.log('  ⏳ Waiting 5s before next prompt...');
+                await sleep(5000);
+              }
+            }
+          }
+
+          // ─── SUMMARY ──────────────────────────────────────────────────────────────
+          const skippedCount = results.filter(r => r.status === 'skipped').length;
+          console.log('\n============================================================');
+          console.log('  🏁  GENERATION COMPLETE');
+          console.log('============================================================');
+          console.log(`✅ Success : ${successCount}/${PROMPTS.length}`);
+          console.log(`❌ Failed  : ${failedCount}/${PROMPTS.length}`);
+          console.log(`⏭️  Skipped : ${skippedCount}/${PROMPTS.length}`);
+          console.log('');
+          console.log('📋 Results:');
+          results.forEach((r, i) => {
+            const icon = r.status === 'success' ? '✅' : r.status === 'failed' ? '❌' : '⏭️';
+            const detail = r.status === 'success'
+              ? `"${r.title}" [${r.category}] → ${r.keys?.map(k => `${k.dbName}:${k.key}`).join(', ')}`
+              : r.status === 'failed'
+              ? `FAILED: ${r.error?.slice(0, 80)}`
+              : 'SKIPPED';
+            console.log(`  ${icon} [${i + 1}] "${r.prompt?.slice(0, 40)}" → ${detail}`);
+          });
+          console.log('============================================================');
+
+          if (failedCount === PROMPTS.length) {
+            process.exit(1);
+          }
+          SCRIPT_EOF
+          node --experimental-vm-modules generator.mjs
+
+      - name: 📊 Upload Run Summary
+        if: always()
+        run: |
+          echo "## ☁️ Bulk Ringtone Generator Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Prompts | See workflow input |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duration | ${{ github.event.inputs.length_seconds }}s per ringtone |" >> $GITHUB_STEP_SUMMARY
+          echo "| Auto-process | ${{ github.event.inputs.auto_process }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Volume Boost | ${{ github.event.inputs.volume_boost_pct }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Account | ${{ github.event.inputs.target_account }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Ringtones pushed to Firebase with status **queued** — Zedge bot will pick them up on next run." >> $GITHUB_STEP_SUMMARY
