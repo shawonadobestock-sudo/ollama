@@ -1,9 +1,9 @@
-name: Gemma 4 API (Production Fix)
+name: Gemma 4 API (Latest Model)
 on:
   workflow_dispatch:
 
 jobs:
-  serve:
+  run-latest-ai:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -13,21 +13,19 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Configure and Start Ollama
+      - name: Start Ollama Server
         run: |
-          # 0.0.0.0:11434 = Listen on all network interfaces
-          # OLLAMA_ORIGINS="*" = Allow the chatbot website to connect
+          # Bind to 0.0.0.0 so the ngrok tunnel can see it
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_ORIGINS="*"
-          
-          echo "Starting Ollama Server..."
           ollama serve & 
-          sleep 15 # Wait for initialization
+          sleep 15
 
-      - name: Pull Model
+      - name: Pull Latest Gemma 4
         run: |
-          # Pulling gemma:2b for stability on 7GB RAM runners
-          ollama pull gemma:2b
+          # We use 'gemma4:2b' as it is the most stable 'latest' model for 7GB RAM
+          echo "Pulling latest Gemma 4 model..."
+          ollama pull gemma4:2b
 
       - name: Setup ngrok Tunnel
         env:
@@ -41,15 +39,16 @@ jobs:
           # Authenticate
           ngrok config add-authtoken $NGROK_AUTH_TOKEN
           
-          # CRITICAL: --host-header fix for Ollama API
-          echo "Starting Tunnel..."
+          # Start ngrok with the Host Header Fix to prevent 403 Forbidden errors
           ngrok http 11434 --host-header="localhost:11434" --log=stdout &
           sleep 10
           
           echo "------------------------------------------------"
-          echo "PUBLIC ENDPOINT FOR CHATBOT:"
+          echo "NEW ENDPOINT URL:"
           curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
           echo "------------------------------------------------"
+          echo "IMPORTANT: In your Python/HTML, use model: 'gemma4:2b'"
+          echo "------------------------------------------------"
           
-          # Keep Action alive for 6 hours
+          # Keeps the runner alive for 6 hours
           sleep 21600
