@@ -1,0 +1,54 @@
+name: Gemma 4 API Tunnel
+on:
+  workflow_dispatch:
+
+jobs:
+  run-gemma-api:
+    runs-on: ubuntu-latest
+    # Setting a high timeout to keep the API alive as long as possible
+    timeout-minutes: 360 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama Server
+        run: |
+          ollama serve > ollama.log 2>&1 &
+          sleep 10 # Wait for initialization
+
+      - name: Download Gemma 4
+        run: |
+          # Note: Using gemma:2b/7b syntax as Gemma 4 identifies internally
+          # Adjust the tag based on the specific quantized version you need
+          ollama pull gemma4
+
+      - name: Install Cloudflared for Tunneling
+        run: |
+          wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+
+      - name: Start Public API Tunnel
+        run: |
+          # Start the tunnel and extract the public URL to the logs
+          cloudflared tunnel --url http://localhost:11434 > tunnel.log 2>&1 &
+          sleep 5
+          echo "------------------------------------------------"
+          echo "YOUR PUBLIC API ENDPOINT URL:"
+          grep -o 'https://[-0-9a-z]*\.trycloudflare.com' tunnel.log
+          echo "------------------------------------------------"
+
+      - name: Keep Runner Alive
+        run: |
+          echo "API is live. You can now send requests to the URL above."
+          echo "Example: curl [YOUR_URL]/api/generate -d '{\"model\": \"gemma4\", \"prompt\": \"hi\"}'"
+          
+          # This loop keeps the action running so the API stays active
+          # It will stop automatically after 6 hours (GitHub limit)
+          for i in {1..21600}; do
+            sleep 1
+          done
