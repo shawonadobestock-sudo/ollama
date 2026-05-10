@@ -1,9 +1,9 @@
-name: Gemma 4 API (Latest Model)
+name: Gemma 4 API (E2B Version)
 on:
   workflow_dispatch:
 
 jobs:
-  run-latest-ai:
+  serve-ai:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -13,42 +13,37 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama Server
+      - name: Start Ollama (Remote Config)
         run: |
-          # Bind to 0.0.0.0 so the ngrok tunnel can see it
+          # 0.0.0.0 allows ngrok to connect to the internal port
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_ORIGINS="*"
           ollama serve & 
           sleep 15
 
-      - name: Pull Latest Gemma 4
+      - name: Pull Effective Gemma 4
         run: |
-          # We use 'gemma4:2b' as it is the most stable 'latest' model for 7GB RAM
-          echo "Pulling latest Gemma 4 model..."
-          ollama pull gemma4:2b
+          # 'e2b' is the correct tag for the 2026 small Gemma 4 model
+          echo "Pulling gemma4:e2b..."
+          ollama pull gemma4:e2b
 
       - name: Setup ngrok Tunnel
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          # Install ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
-          
-          # Authenticate
           ngrok config add-authtoken $NGROK_AUTH_TOKEN
           
-          # Start ngrok with the Host Header Fix to prevent 403 Forbidden errors
+          # Fix the Host Header for external API access
           ngrok http 11434 --host-header="localhost:11434" --log=stdout &
           sleep 10
           
           echo "------------------------------------------------"
-          echo "NEW ENDPOINT URL:"
-          curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
-          echo "------------------------------------------------"
-          echo "IMPORTANT: In your Python/HTML, use model: 'gemma4:2b'"
+          echo "PUBLIC URL: $(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
+          echo "MODEL TAG TO USE: gemma4:e2b"
           echo "------------------------------------------------"
           
-          # Keeps the runner alive for 6 hours
+          # 6-hour runtime
           sleep 21600
